@@ -11,6 +11,7 @@ from dateutil import parser as date_parser
 from aiogram import Bot, Dispatcher, Router, types
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
 load_dotenv()
 
@@ -141,7 +142,12 @@ async def notify_users(payout):
     except Exception:
         creation_time_formatted = creation_time_raw
 
-    message = (
+    # Fetch pending payouts to check if we need to show list
+    pending_payouts = await fetch_pending_payouts()
+    pending_count = len(pending_payouts) if pending_payouts else 0
+
+    keyboard = None
+    message_text = (
         f"<b>🔔 Выплата больше текущих в обработке!</b>\n\n"
         f"<b>UUID:</b> <code>{uuid}</code>\n"
         f"<b>Клиент:</b> {customer_name} {customer_surname}\n"
@@ -149,8 +155,63 @@ async def notify_users(payout):
         f"<b>Время создания:</b> {creation_time_formatted} (UTC +3)"
     )
 
+    # If <= 4 payouts in progress, show simple "Accept" button
+    if pending_count <= 4:
+        keyboard = InlineKeyboardMarkup(
+            inline_keyboard=[[
+                InlineKeyboardButton(text="✅ Принять", callback_data=f"accept_{uuid}")
+            ]]
+        )
+    else:
+        # If >= 5 payouts, show numbered list with cancel buttons
+        pending_list = "\n\n<b>Выплаты в обработке (отмените одну перед принятием):</b>\n"
+        for idx, payout_item in enumerate(pending_payouts, 1):
+            p_uuid = payout_item.get("uuid", "N/A")
+            p_name = payout_item.get("customer_name", "")
+            p_surname = payout_item.get("customer_surname", "")
+            p_amount = payout_item.get("amount", "N/A")
+            p_time = payout_item.get("creation_time", "N/A")
+            try:
+                p_time = p_time.split("+")[0].split(".")[0]
+            except:
+                pass
+            try:
+                p_amount = f"{float(p_amount):.1f}"
+            except:
+                pass
+            pending_list += f"{idx}. {p_name} {p_surname} - {p_amount} KGS ({p_time})\n"
+
+        message_text += pending_list
+
+        # Create numbered buttons for cancellation
+        buttons = []
+        for idx in range(min(len(pending_payouts), 5)):  # Max 5 buttons per row
+            buttons.append(
+                InlineKeyboardButton(
+                    text=str(idx + 1),
+                    callback_data=f"cancel_{pending_payouts[idx].get('uuid')}_{uuid}"
+                )
+            )
+
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[buttons])
+
     for user_id in user_ids:
-        await send_notification(user_id, message)
+        try:
+            if keyboard:
+                await bot.send_message(
+                    chat_id=user_id,
+                    text=message_text,
+                    parse_mode="HTML",
+                    reply_markup=keyboard
+                )
+            else:
+                await bot.send_message(
+                    chat_id=user_id,
+                    text=message_text,
+                    parse_mode="HTML"
+                )
+        except Exception as e:
+            print(f"Error sending message to {user_id}: {e}")
         await asyncio.sleep(0.1)  # Rate limiting
 
 
@@ -284,6 +345,96 @@ async def handle_update(message: types.Message):
     await message.reply("⏳ Проверяю выплаты...")
     await check_payouts()
     await message.reply("✅ Проверка завершена")
+
+
+@router.callback_query(lambda c: c.data.startswith("accept_"))
+async def handle_accept_callback(callback_query: types.CallbackQuery):
+    """Handle accept button click"""
+    payout_uuid = callback_query.data.split("_", 1)[1]
+    
+    # Disable all buttons to prevent double-click
+    await callback_query.message.edit_reply_markup(reply_markup=None)
+    await callback_query.answer("⏳ Принимаю выплату...", show_alert=False)
+    
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                f"{BACKEND_URL}/accept-payouts",
+                json={"ids": [payout_uuid]},
+                timeout=aiohttp.ClientTimeout(total=30)
+            ) as resp:
+                if resp.status == 200:
+                    result = await resp.json()
+                    success_count = len(result.get("success", []))
+                    error_count = len(result.get("error", {}))
+                    
+                    response_text = f"✅ Принято: {success_count} выплат"
+                    if error_count > 0:
+                        response_text += f"\n❌ Ошибки: {error_count}"
+                    
+                    await callback_query.message.edit_text(
+                        callback_query.message.text + f"\n\n{response_text}",
+                        parse_mode="HTML"
+                    )
+                else:
+                    await callback_query.message.edit_text(
+                        callback_query.message.text + "\n\n❌ Ошибка принятия выплаты",
+                        parse_mode="HTML"
+                    )
+    except Exception as e:
+        print(f"Error accepting payout: {e}")
+        await callback_query.answer(f"❌ Ошибка: {str(e)}", show_alert=True)
+
+
+@router.callback_query(lambda c: c.data.startswith("cancel_"))
+async def handle_cancel_callback(callback_query: types.CallbackQuery):
+    """Handle cancel button click"""
+    parts = callback_query.data.split("_", 2)
+    cancel_uuid = parts[1]
+    new_payout_uuid = parts[2] if len(parts) > 2 else None
+    
+    # Disable all buttons to prevent double-click
+    await callback_query.message.edit_reply_markup(reply_markup=None)
+    await callback_query.answer("⏳ Отменяю выплату...", show_alert=False)
+    
+    try:
+        async with aiohttp.ClientSession() as session:
+            # Cancel existing payout
+            async with session.post(
+                f"{BACKEND_URL}/cancel-payouts",
+                json={"ids": [cancel_uuid]},
+                timeout=aiohttp.ClientTimeout(total=30)
+            ) as resp:
+                if resp.status == 200:
+                    cancel_result = await resp.json()
+                    cancel_success = len(cancel_result.get("success", []))
+                    
+                    # Accept new payout if provided
+                    accept_text = ""
+                    if new_payout_uuid:
+                        async with session.post(
+                            f"{BACKEND_URL}/accept-payouts",
+                            json={"ids": [new_payout_uuid]},
+                            timeout=aiohttp.ClientTimeout(total=30)
+                        ) as accept_resp:
+                            if accept_resp.status == 200:
+                                accept_result = await accept_resp.json()
+                                accept_success = len(accept_result.get("success", []))
+                                accept_text = f"\n✅ Принято: {accept_success} новых выплат"
+                    
+                    response_text = f"✅ Отменено: {cancel_success} выплат{accept_text}"
+                    await callback_query.message.edit_text(
+                        callback_query.message.text + f"\n\n{response_text}",
+                        parse_mode="HTML"
+                    )
+                else:
+                    await callback_query.message.edit_text(
+                        callback_query.message.text + "\n\n❌ Ошибка отмены выплаты",
+                        parse_mode="HTML"
+                    )
+    except Exception as e:
+        print(f"Error cancelling payout: {e}")
+        await callback_query.answer(f"❌ Ошибка: {str(e)}", show_alert=True)
 
 
 async def main():
