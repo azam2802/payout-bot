@@ -105,6 +105,28 @@ def get_max_pending_amount(pending_payouts):
         return 0
 
 
+def format_amount(amount):
+    """Format amount with thousands separator and 1 decimal place"""
+    try:
+        value = float(amount)
+        # Format with 1 decimal place
+        formatted = f"{value:.1f}"
+        # Split into parts
+        parts = formatted.split('.')
+        integer_part = parts[0]
+        decimal_part = parts[1] if len(parts) > 1 else '0'
+        
+        # Add thousands separator
+        integer_with_sep = '{:,}'.format(int(integer_part)).replace(',', ' ')
+        
+        # Only show decimal if it's not 0
+        if decimal_part == '0':
+            return integer_with_sep
+        return f"{integer_with_sep} {decimal_part}"
+    except (ValueError, TypeError):
+        return str(amount)
+
+
 async def send_notification(user_id, message):
     """Send notification to user"""
     try:
@@ -129,7 +151,7 @@ async def notify_users(payout):
     amount = payout.get("amount", "N/A")
     # Format amount with 1 decimal place and KGS currency
     try:
-        amount_formatted = f"{float(amount):.1f} KGS"
+        amount_formatted = f"{format_amount(amount)} KGS"
     except (ValueError, TypeError):
         amount_formatted = f"{amount} KGS"
 
@@ -148,10 +170,10 @@ async def notify_users(payout):
 
     keyboard = None
     message_text = (
-        f"<b>🔔 Выплата больше текущих в обработке!</b>\n\n"
+        f"<b>🔔 Новая выплата!</b>\n\n"
+        f"<b>Сумма:</b> {amount_formatted}\n"
         f"<b>UUID:</b> <code>{uuid}</code>\n"
         f"<b>Клиент:</b> {customer_name} {customer_surname}\n"
-        f"<b>Сумма:</b> {amount_formatted}\n"
         f"<b>Время создания:</b> {creation_time_formatted} (UTC +3)"
     )
 
@@ -179,10 +201,10 @@ async def notify_users(payout):
             except:
                 pass
             try:
-                p_amount = f"{float(p_amount):.1f}"
+                p_amount = f"{format_amount(p_amount)}"
             except:
                 pass
-            pending_list += f"{idx}. {p_name} {p_surname} - {p_amount} KGS ({p_time})\n"
+            pending_list += f"{idx}. {p_name} {p_surname} - {p_amount} KGS\n"
 
         message_text += pending_list
 
@@ -504,7 +526,7 @@ async def handle_cancel_callback(callback_query: types.CallbackQuery):
                             except:
                                 pass
                             try:
-                                p_amount = f"{float(p_amount):.1f}"
+                                p_amount = f"{format_amount(p_amount)}"
                             except:
                                 pass
                             response_text += f"{idx}. {p_name} {p_surname} - {p_amount} KGS ({p_time})\n"
