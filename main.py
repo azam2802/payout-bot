@@ -19,7 +19,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 BACKEND_URL = os.getenv("BACKEND_URL", "http://localhost:3000")
 PROCESSED_UUIDS_FILE = "processed_uuids.json"
 USER_IDS_FILE = "user_ids.json"
-CHECK_INTERVAL = 10  # 1 minute
+CHECK_INTERVAL = 5  # 5 seconds
 RECENT_MINUTES = 5
 
 bot = Bot(token=BOT_TOKEN)
