@@ -21,7 +21,7 @@ BACKEND_URL = os.getenv("BACKEND_URL", "http://localhost:3000")
 PROCESSED_UUIDS_FILE = "processed_uuids.json"
 USER_IDS_FILE = "user_ids.json"
 AUTO_MODE_FILE = "auto_mode.json"
-CHECK_INTERVAL = 5  # 1 minute
+CHECK_INTERVAL = 5  # 5 seconds
 RECENT_MINUTES = 5
 
 bot = Bot(token=BOT_TOKEN)
@@ -388,26 +388,36 @@ async def check_payouts():
         all_payouts = await fetch_payouts()
         pending_payouts = await fetch_pending_payouts()
 
-        if (
-            pending_payouts is None
-            or len(pending_payouts) == 0
-            or len(all_payouts) == 0
-            or all_payouts is None
-        ):
+        # Check if we have any payouts to process
+        if all_payouts is None or len(all_payouts) == 0:
             print(f"[{datetime.now()}] No payouts data.")
             return
 
-        pending_amounts = []
-        for pending in pending_payouts:
-            try:
-                amount_val = float(pending.get("amount", 0))
-                if math.isfinite(amount_val):
-                    pending_amounts.append(amount_val)
-            except (ValueError, TypeError):
-                continue
-        if not pending_amounts:
-            print(f"[{datetime.now()}] Pending payouts contain no comparable amounts.")
-            return
+        # Check auto mode status
+        auto_enabled, min_amount, max_amount = load_auto_mode()
+
+        # If no pending payouts
+        if pending_payouts is None or len(pending_payouts) == 0:
+            # In manual mode - skip processing (no notifications)
+            if not auto_enabled:
+                print(f"[{datetime.now()}] Manual mode: No pending payouts, skipping notifications.")
+                return
+            
+            # In auto mode - process with base amount 0
+            print(f"[{datetime.now()}] Auto mode: No pending payouts, checking for new payouts to auto-accept...")
+            pending_amounts = [0]  # Any new payout will be greater than 0
+        else:
+            pending_amounts = []
+            for pending in pending_payouts:
+                try:
+                    amount_val = float(pending.get("amount", 0))
+                    if math.isfinite(amount_val):
+                        pending_amounts.append(amount_val)
+                except (ValueError, TypeError):
+                    continue
+            if not pending_amounts:
+                print(f"[{datetime.now()}] Pending payouts contain no comparable amounts, using 0 as base.")
+                pending_amounts = [0]
 
         # Filter recent payouts not yet processed
         recent_new_payouts = []
