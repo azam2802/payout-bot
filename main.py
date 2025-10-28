@@ -11,6 +11,7 @@ from dateutil import parser as date_parser
 from aiogram import Bot, Dispatcher, Router, types
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
 load_dotenv()
@@ -19,13 +20,19 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 BACKEND_URL = os.getenv("BACKEND_URL", "http://localhost:3000")
 PROCESSED_UUIDS_FILE = "processed_uuids.json"
 USER_IDS_FILE = "user_ids.json"
-CHECK_INTERVAL = 5  # 5 seconds
+AUTO_MODE_FILE = "auto_mode.json"
+CHECK_INTERVAL = 5  # 1 minute
 RECENT_MINUTES = 5
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 router = Router()
 dp.include_router(router)
+
+
+class AutoModeStates(StatesGroup):
+    """States for auto mode configuration"""
+    waiting_for_range = State()
 
 
 def load_processed_uuids():
@@ -61,6 +68,25 @@ def add_user_id(user_id):
     user_ids = load_user_ids()
     user_ids.add(user_id)
     save_user_ids(user_ids)
+
+
+def load_auto_mode():
+    """Load auto mode status from file"""
+    if Path(AUTO_MODE_FILE).exists():
+        with open(AUTO_MODE_FILE, "r") as f:
+            data = json.load(f)
+            return data.get("enabled", False), data.get("min_amount"), data.get("max_amount")
+    return False, None, None
+
+
+def save_auto_mode(enabled, min_amount=None, max_amount=None):
+    """Save auto mode status to file"""
+    with open(AUTO_MODE_FILE, "w") as f:
+        json.dump({
+            "enabled": enabled,
+            "min_amount": min_amount,
+            "max_amount": max_amount
+        }, f, indent=2)
 
 
 async def fetch_payouts():
@@ -105,28 +131,6 @@ def get_max_pending_amount(pending_payouts):
         return 0
 
 
-def format_amount(amount):
-    """Format amount with thousands separator and 1 decimal place"""
-    try:
-        value = float(amount)
-        # Format with 1 decimal place
-        formatted = f"{value:.1f}"
-        # Split into parts
-        parts = formatted.split('.')
-        integer_part = parts[0]
-        decimal_part = parts[1] if len(parts) > 1 else '0'
-        
-        # Add thousands separator
-        integer_with_sep = '{:,}'.format(int(integer_part)).replace(',', ' ')
-        
-        # Only show decimal if it's not 0
-        if decimal_part == '0':
-            return integer_with_sep
-        return f"{integer_with_sep} {decimal_part}"
-    except (ValueError, TypeError):
-        return str(amount)
-
-
 async def send_notification(user_id, message):
     """Send notification to user"""
     try:
@@ -137,8 +141,8 @@ async def send_notification(user_id, message):
         return False
 
 
-async def notify_users(payout):
-    """Send notification to all users about new high-value payout"""
+async def send_manual_notification(payout):
+    """Send manual notification with buttons for a payout"""
     user_ids = load_user_ids()
 
     if not user_ids:
@@ -151,7 +155,7 @@ async def notify_users(payout):
     amount = payout.get("amount", "N/A")
     # Format amount with 1 decimal place and KGS currency
     try:
-        amount_formatted = f"{format_amount(amount)} KGS"
+        amount_formatted = f"{float(amount):.1f} KGS"
     except (ValueError, TypeError):
         amount_formatted = f"{amount} KGS"
 
@@ -170,10 +174,10 @@ async def notify_users(payout):
 
     keyboard = None
     message_text = (
-        f"<b>🔔 Новая выплата!</b>\n\n"
-        f"<b>Сумма:</b> {amount_formatted}\n"
+        f"<b>🔔 Выплата больше текущих в обработке!</b>\n\n"
         f"<b>UUID:</b> <code>{uuid}</code>\n"
         f"<b>Клиент:</b> {customer_name} {customer_surname}\n"
+        f"<b>Сумма:</b> {amount_formatted}\n"
         f"<b>Время создания:</b> {creation_time_formatted} (UTC +3)"
     )
 
@@ -201,10 +205,10 @@ async def notify_users(payout):
             except:
                 pass
             try:
-                p_amount = f"{format_amount(p_amount)}"
+                p_amount = f"{float(p_amount):.1f}"
             except:
                 pass
-            pending_list += f"{idx}. {p_name} {p_surname} - {p_amount} KGS\n"
+            pending_list += f"{idx}. {p_name} {p_surname} - {p_amount} KGS ({p_time})\n"
 
         message_text += pending_list
 
@@ -241,6 +245,138 @@ async def notify_users(payout):
         except Exception as e:
             print(f"Error sending message to {user_id}: {e}")
         await asyncio.sleep(0.1)  # Rate limiting
+
+
+
+async def handle_auto_mode(payout):
+    """Handle automatic payout acceptance"""
+    try:
+        auto_enabled, min_amount, max_amount = load_auto_mode()
+        
+        pending_payouts = await fetch_pending_payouts()
+        pending_count = len(pending_payouts) if pending_payouts else 0
+        
+        uuid = payout.get("uuid", "N/A")
+        customer_name = payout.get("customer_name", "")
+        customer_surname = payout.get("customer_surname", "")
+        amount = payout.get("amount", "N/A")
+        try:
+            amount_formatted = f"{float(amount):.1f} KGS"
+            amount_value = float(amount)
+        except (ValueError, TypeError):
+            amount_formatted = f"{amount} KGS"
+            amount_value = 0
+            
+        print(f"[AUTO MODE] New payout: {uuid}, Amount: {amount}, Pending: {pending_count}")
+        
+        # Check if amount is in range
+        if min_amount is not None and max_amount is not None:
+            if not (min_amount <= amount_value <= max_amount):
+                print(f"[AUTO MODE] Amount {amount_value} is outside range [{min_amount}, {max_amount}], sending manual notification")
+                # Send manual notification with buttons (same as manual mode)
+                await send_manual_notification(payout)
+                return
+        
+        if pending_count < 5:
+            # Simply accept the new payout
+            print(f"[AUTO MODE] Accepting payout {uuid} (pending < 5)")
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    f"{BACKEND_URL}/accept-payouts",
+                    json={"ids": [uuid]},
+                    timeout=aiohttp.ClientTimeout(total=30)
+                ) as resp:
+                    if resp.status == 200:
+                        result = await resp.json()
+                        success_count = len(result.get("success", []))
+                        print(f"[AUTO MODE] ✅ Accepted: {success_count} payouts")
+        
+                        # Notify users
+                        user_ids = load_user_ids()
+                        message = (
+                            f"<b>🤖 Автоматически принято!</b>\n\n"
+                            f"<b>UUID:</b> <code>{uuid}</code>\n"
+                            f"<b>Клиент:</b> {customer_name} {customer_surname}\n"
+                            f"<b>Сумма:</b> {amount_formatted} KGS\n"
+                            f"<b>В обработке было:</b> {pending_count}/5"
+                        )
+                        for user_id in user_ids:
+                            await send_notification(user_id, message)
+                    else:
+                        print(f"[AUTO MODE] ❌ Error accepting: {resp.status}")
+        else:
+            # Cancel the smallest payout and accept the new one
+            print(f"[AUTO MODE] Pending >= 5, finding smallest to cancel")
+            
+            # Find the smallest payout
+            smallest_payout = min(pending_payouts, key=lambda p: float(p.get("amount", 0)))
+            smallest_uuid = smallest_payout.get("uuid")
+            smallest_amount = smallest_payout.get("amount")
+            smallest_name = smallest_payout.get("customer_name", "")
+            smallest_surname = smallest_payout.get("customer_surname", "")
+            
+            print(f"[AUTO MODE] Cancelling smallest: {smallest_uuid}, Amount: {smallest_amount}")
+            
+            async with aiohttp.ClientSession() as session:
+                # Cancel the smallest payout
+                async with session.post(
+                    f"{BACKEND_URL}/cancel-payouts",
+                    json={"ids": [smallest_uuid]},
+                    timeout=aiohttp.ClientTimeout(total=30)
+                ) as resp:
+                    if resp.status == 200:
+                        cancel_result = await resp.json()
+                        cancel_success = len(cancel_result.get("success", []))
+                        print(f"[AUTO MODE] ✅ Cancelled: {cancel_success} payouts")
+                        
+                        # Accept the new payout
+                        async with session.post(
+                            f"{BACKEND_URL}/accept-payouts",
+                            json={"ids": [uuid]},
+                            timeout=aiohttp.ClientTimeout(total=30)
+                        ) as accept_resp:
+                            if accept_resp.status == 200:
+                                accept_result = await accept_resp.json()
+                                accept_success = len(accept_result.get("success", []))
+                                print(f"[AUTO MODE] ✅ Accepted new: {accept_success} payouts")
+                                
+                                # Notify users
+                                user_ids = load_user_ids()
+                                message = (
+                                    f"<b>🤖 Автоматически принято!</b>\n\n"
+                                    f"<b>❌ Отменено:</b>\n"
+                                    f"Клиент: {smallest_name} {smallest_surname}\n"
+                                    f"Сумма: {smallest_amount} KGS\n\n"
+                                    f"<b>✅ Принято:</b>\n"
+                                    f"Клиент: {customer_name} {customer_surname}\n"
+                                    f"Сумма: {amount} KGS\n\n"
+                                    f"<b>В обработке было:</b> {pending_count}/5"
+                                )
+                                for user_id in user_ids:
+                                    await send_notification(user_id, message)
+                            else:
+                                print(f"[AUTO MODE] ❌ Error accepting new: {accept_resp.status}")
+                    else:
+                        print(f"[AUTO MODE] ❌ Error cancelling: {resp.status}")
+                        
+    except Exception as e:
+        print(f"[AUTO MODE] Error: {e}")
+        import traceback
+        traceback.print_exc()
+
+
+
+async def notify_users(payout):
+    """Send notification to all users about new high-value payout"""
+    auto_enabled, min_amount, max_amount = load_auto_mode()
+    
+    # If auto mode is enabled, handle automatically
+    if auto_enabled:
+        await handle_auto_mode(payout)
+        return
+    
+    # Manual mode - send notification with buttons
+    await send_manual_notification(payout)
 
 
 async def check_payouts():
@@ -357,9 +493,15 @@ async def handle_status(message: types.Message):
     """Handle /status command"""
     processed_uuids = load_processed_uuids()
     pending_payouts = await fetch_pending_payouts()
+    auto_enabled, min_amount, max_amount = load_auto_mode()
+    
+    mode_text = "🤖 Автоматический" if auto_enabled else "👤 Ручной"
+    if auto_enabled and min_amount is not None and max_amount is not None:
+        mode_text += f" ({min_amount}-{max_amount} KGS)"
 
     message_text = (
         f"<b>📊 Статус бота</b>\n\n"
+        f"<b>Режим:</b> {mode_text}\n"
         f"<b>Обработано выплат:</b> {len(processed_uuids)}\n"
         f"<b>В обработке:</b> {len(pending_payouts)}\n"
         f"<b>Макс сумма в обработке:</b> {get_max_pending_amount(pending_payouts)}"
@@ -373,6 +515,85 @@ async def handle_update(message: types.Message):
     await message.reply("⏳ Проверяю выплаты...")
     await check_payouts()
     await message.reply("✅ Проверка завершена")
+
+
+@router.message(Command("mode"))
+async def handle_mode(message: types.Message, state: FSMContext):
+    """Handle /mode command - toggle auto mode"""
+    auto_enabled, min_amount, max_amount = load_auto_mode()
+    
+    if auto_enabled:
+        # Disable auto mode
+        save_auto_mode(False)
+        await message.reply(
+            "👤 <b>Ручной режим ВКЛЮЧЕН</b>\n\n"
+            "Бот будет отправлять уведомления с кнопками для ручного управления.",
+            parse_mode="HTML"
+        )
+    else:
+        # Ask for range before enabling
+        await message.reply(
+            "🤖 <b>Настройка автоматического режима</b>\n\n"
+            "Укажите диапазон сумм для автоматического принятия в формате:\n"
+            "<code>минимум-максимум</code>\n\n"
+            "Например: <code>5000-10000</code>\n\n"
+            "Или отправьте <code>0</code> для принятия всех выплат без ограничений.",
+            parse_mode="HTML"
+        )
+        await state.set_state(AutoModeStates.waiting_for_range)
+
+
+@router.message(AutoModeStates.waiting_for_range)
+async def handle_range_input(message: types.Message, state: FSMContext):
+    """Handle range input for auto mode"""
+    user_input = message.text.strip()
+    
+    try:
+        if user_input == "0":
+            # No limits
+            save_auto_mode(True, None, None)
+            await message.reply(
+                "🤖 <b>Автоматический режим ВКЛЮЧЕН</b>\n\n"
+                "Диапазон: <b>БЕЗ ОГРАНИЧЕНИЙ</b>\n\n"
+                "Бот будет автоматически принимать все новые выплаты:\n"
+                "• Если в обработке &lt;5 выплат → принять новую\n"
+                "• Если в обработке ≥5 выплат → отменить самую маленькую и принять новую",
+                parse_mode="HTML"
+            )
+        else:
+            # Parse range
+            parts = user_input.split("-")
+            if len(parts) != 2:
+                raise ValueError("Invalid format")
+            
+            min_amount = float(parts[0].strip())
+            max_amount = float(parts[1].strip())
+            
+            if min_amount < 0 or max_amount < 0 or min_amount > max_amount:
+                raise ValueError("Invalid range")
+            
+            save_auto_mode(True, min_amount, max_amount)
+            await message.reply(
+                f"🤖 <b>Автоматический режим ВКЛЮЧЕН</b>\n\n"
+                f"Диапазон: <b>{min_amount:.0f} - {max_amount:.0f} KGS</b>\n\n"
+                f"Бот будет автоматически принимать новые выплаты в указанном диапазоне:\n"
+                f"• Если в обработке &lt;5 выплат → принять новую\n"
+                f"• Если в обработке ≥5 выплат → отменить самую маленькую и принять новую",
+                parse_mode="HTML"
+            )
+        
+        await state.clear()
+        
+    except Exception as e:
+        await message.reply(
+            "❌ <b>Ошибка!</b>\n\n"
+            "Неверный формат. Укажите диапазон в формате:\n"
+            "<code>минимум-максимум</code>\n\n"
+            "Например: <code>5000-10000</code>\n"
+            "Или <code>0</code> для всех выплат без ограничений.",
+            parse_mode="HTML"
+        )
+
 
 
 @router.callback_query(lambda c: c.data.startswith("accept_"))
@@ -526,7 +747,7 @@ async def handle_cancel_callback(callback_query: types.CallbackQuery):
                             except:
                                 pass
                             try:
-                                p_amount = f"{format_amount(p_amount)}"
+                                p_amount = f"{float(p_amount):.1f}"
                             except:
                                 pass
                             response_text += f"{idx}. {p_name} {p_surname} - {p_amount} KGS ({p_time})\n"
