@@ -272,9 +272,9 @@ async def handle_auto_mode(payout):
         # Check if amount is in range
         if min_amount is not None and max_amount is not None:
             if not (min_amount <= amount_value <= max_amount):
-                print(f"[AUTO MODE] Amount {amount_value} is outside range [{min_amount}, {max_amount}], sending manual notification")
+                print(f"[AUTO MODE] Amount {amount_value} is outside range [{min_amount}, {max_amount}], skipping")
                 # Send manual notification with buttons (same as manual mode)
-                await send_manual_notification(payout)
+                # await send_manual_notification(payout)
                 return
         
         if pending_count < 5:
