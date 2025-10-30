@@ -89,6 +89,56 @@ def save_auto_mode(enabled, min_amount=None, max_amount=None):
         }, f, indent=2)
 
 
+async def accept_payout_with_retry(payout_uuid, max_retries=3):
+    """Accept payout with retry logic for invalid signature errors"""
+    for attempt in range(1, max_retries + 1):
+        print(f"[ACCEPT] Attempt {attempt}/{max_retries} for UUID: {payout_uuid}")
+        
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                f"{BACKEND_URL}/accept-payouts",
+                json={"ids": [payout_uuid]},
+                timeout=aiohttp.ClientTimeout(total=30)
+            ) as resp:
+                print(f"[ACCEPT] Response status: {resp.status}")
+                response_data = await resp.json()
+                print(f"[ACCEPT] Response data: {response_data}")
+                
+                if resp.status == 200:
+                    result = response_data
+                    success_count = len(result.get("success", []))
+                    errors = result.get("error", {})
+                    
+                    # Check if there are errors and if they are signature-related
+                    if success_count > 0:
+                        # Success!
+                        return {"success": True, "data": result, "attempt": attempt}
+                    
+                    if errors:
+                        # Check if all errors are invalid signature
+                        has_signature_error = any(
+                            err.get("message") == "invalid signature" 
+                            for err in errors.values()
+                        )
+                        
+                        if has_signature_error and attempt < max_retries:
+                            print(f"[ACCEPT] Invalid signature error, retrying... ({attempt}/{max_retries})")
+                            continue
+                        else:
+                            # Either not a signature error or max retries reached
+                            return {"success": False, "data": result, "attempt": attempt, "final": True}
+                    
+                    # No success and no errors (shouldn't happen, but handle it)
+                    return {"success": False, "data": result, "attempt": attempt, "final": True}
+                else:
+                    # Non-200 status
+                    error_msg = await resp.text()
+                    return {"success": False, "error_msg": error_msg, "status": resp.status, "attempt": attempt, "final": True}
+    
+    # Max retries reached
+    return {"success": False, "data": {"success": [], "error": {}}, "attempt": max_retries, "final": True, "max_retries_reached": True}
+
+
 async def fetch_payouts():
     """Fetch payouts from backend"""
     try:
@@ -280,30 +330,32 @@ async def handle_auto_mode(payout):
         if pending_count < 5:
             # Simply accept the new payout
             print(f"[AUTO MODE] Accepting payout {uuid} (pending < 5)")
-            async with aiohttp.ClientSession() as session:
-                async with session.post(
-                    f"{BACKEND_URL}/accept-payouts",
-                    json={"ids": [uuid]},
-                    timeout=aiohttp.ClientTimeout(total=30)
-                ) as resp:
-                    if resp.status == 200:
-                        result = await resp.json()
-                        success_count = len(result.get("success", []))
-                        print(f"[AUTO MODE] ✅ Accepted: {success_count} payouts")
-        
-                        # Notify users
-                        user_ids = load_user_ids()
-                        message = (
-                            f"<b>🤖 Автоматически принято!</b>\n\n"
-                            f"<b>UUID:</b> <code>{uuid}</code>\n"
-                            f"<b>Клиент:</b> {customer_name} {customer_surname}\n"
-                            f"<b>Сумма:</b> {amount_formatted} KGS\n"
-                            f"<b>В обработке было:</b> {pending_count}/5"
-                        )
-                        for user_id in user_ids:
-                            await send_notification(user_id, message)
-                    else:
-                        print(f"[AUTO MODE] ❌ Error accepting: {resp.status}")
+            
+            # Use retry logic
+            result = await accept_payout_with_retry(uuid, max_retries=3)
+            
+            if result.get("success"):
+                data = result.get("data", {})
+                success_count = len(data.get("success", []))
+                attempt = result.get("attempt", 1)
+                print(f"[AUTO MODE] ✅ Accepted: {success_count} payouts (attempt {attempt})")
+
+                # Notify users
+                user_ids = load_user_ids()
+                message = (
+                    f"<b>🤖 Автоматически принято!</b>\n\n"
+                    f"<b>UUID:</b> <code>{uuid}</code>\n"
+                    f"<b>Клиент:</b> {customer_name} {customer_surname}\n"
+                    f"<b>Сумма:</b> {amount_formatted}\n"
+                    f"<b>В обработке было:</b> {pending_count}/5"
+                )
+                
+                for user_id in user_ids:
+                    await send_notification(user_id, message)
+            else:
+                attempt = result.get("attempt", 1)
+                print(f"[AUTO MODE] ❌ Error accepting after {attempt} attempts")
+                
         else:
             # Cancel the smallest payout and accept the new one
             print(f"[AUTO MODE] Pending >= 5, finding smallest to cancel")
@@ -329,33 +381,46 @@ async def handle_auto_mode(payout):
                         cancel_success = len(cancel_result.get("success", []))
                         print(f"[AUTO MODE] ✅ Cancelled: {cancel_success} payouts")
                         
-                        # Accept the new payout
-                        async with session.post(
-                            f"{BACKEND_URL}/accept-payouts",
-                            json={"ids": [uuid]},
-                            timeout=aiohttp.ClientTimeout(total=30)
-                        ) as accept_resp:
-                            if accept_resp.status == 200:
-                                accept_result = await accept_resp.json()
-                                accept_success = len(accept_result.get("success", []))
-                                print(f"[AUTO MODE] ✅ Accepted new: {accept_success} payouts")
+                        # Accept the new payout with retry logic
+                        result = await accept_payout_with_retry(uuid, max_retries=3)
+                        
+                        if result.get("success"):
+                            data = result.get("data", {})
+                            accept_success = len(data.get("success", []))
+                            attempt = result.get("attempt", 1)
+                            print(f"[AUTO MODE] ✅ Accepted new: {accept_success} payouts (attempt {attempt})")
+                            
+                            # Notify users
+                            user_ids = load_user_ids()
+                            message = (
+                                f"<b>🤖 Автоматически принято!</b>\n\n"
+                                f"<b>❌ Отменено:</b>\n"
+                                f"Клиент: {smallest_name} {smallest_surname}\n"
+                                f"Сумма: {smallest_amount} KGS\n\n"
+                                f"<b>✅ Принято:</b>\n"
+                                f"Клиент: {customer_name} {customer_surname}\n"
+                                f"Сумма: {amount_formatted}\n\n"
+                                f"<b>В обработке было:</b> {pending_count}/5"
+                            )
+                            if attempt > 1:
+                                message += f"\n<i>(принято с попытки {attempt})</i>"
                                 
-                                # Notify users
-                                user_ids = load_user_ids()
-                                message = (
-                                    f"<b>🤖 Автоматически принято!</b>\n\n"
-                                    f"<b>❌ Отменено:</b>\n"
-                                    f"Клиент: {smallest_name} {smallest_surname}\n"
-                                    f"Сумма: {smallest_amount} KGS\n\n"
-                                    f"<b>✅ Принято:</b>\n"
-                                    f"Клиент: {customer_name} {customer_surname}\n"
-                                    f"Сумма: {amount} KGS\n\n"
-                                    f"<b>В обработке было:</b> {pending_count}/5"
-                                )
-                                for user_id in user_ids:
-                                    await send_notification(user_id, message)
-                            else:
-                                print(f"[AUTO MODE] ❌ Error accepting new: {accept_resp.status}")
+                            for user_id in user_ids:
+                                await send_notification(user_id, message)
+                        else:
+                            attempt = result.get("attempt", 1)
+                            print(f"[AUTO MODE] ❌ Error accepting new payout after {attempt} attempts")
+                            
+                            # Notify users about failure
+                            user_ids = load_user_ids()
+                            message = (
+                                f"<b>⚠️ Ошибка автоматического принятия</b>\n\n"
+                                f"<b>❌ Отменено:</b> {smallest_name} {smallest_surname} ({smallest_amount} KGS)\n"
+                                f"<b>❌ НЕ ПРИНЯТО:</b> {customer_name} {customer_surname} ({amount_formatted})\n"
+                                f"<b>Попыток:</b> {attempt}"
+                            )
+                            for user_id in user_ids:
+                                await send_notification(user_id, message)
                     else:
                         print(f"[AUTO MODE] ❌ Error cancelling: {resp.status}")
                         
@@ -635,36 +700,46 @@ async def handle_accept_callback(callback_query: types.CallbackQuery):
             return
         
         print(f"Sending accept request for UUID: {payout_uuid}")
-        async with aiohttp.ClientSession() as session:
-            async with session.post(
-                f"{BACKEND_URL}/accept-payouts",
-                json={"ids": [payout_uuid]},
-                timeout=aiohttp.ClientTimeout(total=30)
-            ) as resp:
-                print(f"Response status: {resp.status}")
-                response_data = await resp.json()
-                print(f"Response data: {response_data}")
-                
-                if resp.status == 200:
-                    result = response_data
-                    success_count = len(result.get("success", []))
-                    error_count = len(result.get("error", {}))
-                    
-                    response_text = f"✅ Принято: {success_count} выплат"
-                    if error_count > 0:
-                        error_details = result.get("error", {})
-                        response_text += f"\n❌ Ошибки: {error_count}\n{str(error_details)}"
-                    
-                    await callback_query.message.edit_text(
-                        callback_query.message.text + f"\n\n{response_text}",
-                        parse_mode="HTML"
-                    )
-                else:
-                    error_msg = await resp.text()
-                    await callback_query.message.edit_text(
-                        callback_query.message.text + f"\n\n❌ Ошибка ({resp.status}): {error_msg}",
-                        parse_mode="HTML"
-                    )
+        
+        # Use retry logic
+        result = await accept_payout_with_retry(payout_uuid, max_retries=3)
+        
+        if result.get("success"):
+            # Success
+            data = result.get("data", {})
+            success_count = len(data.get("success", []))
+            attempt = result.get("attempt", 1)
+            
+            response_text = f"✅ Принято: {success_count} выплат"
+            if attempt > 1:
+                response_text += f" (попытка {attempt})"
+            
+            await callback_query.message.edit_text(
+                callback_query.message.text + f"\n\n{response_text}",
+                parse_mode="HTML"
+            )
+        else:
+            # Failed
+            attempt = result.get("attempt", 1)
+            
+            if result.get("max_retries_reached"):
+                response_text = f"❌ Не удалось принять выплату после {attempt} попыток"
+            elif "error_msg" in result:
+                response_text = f"❌ Ошибка ({result.get('status')}): {result.get('error_msg')}"
+            else:
+                data = result.get("data", {})
+                errors = data.get("error", {})
+                response_text = f"❌ Ошибка принятия"
+                if errors:
+                    response_text += f"\nДетали: {str(errors)}"
+                if attempt > 1:
+                    response_text += f"\n(попытка {attempt})"
+            
+            await callback_query.message.edit_text(
+                callback_query.message.text + f"\n\n{response_text}",
+                parse_mode="HTML"
+            )
+            
     except Exception as e:
         print(f"Error accepting payout: {e}")
         import traceback
@@ -786,22 +861,22 @@ async def handle_cancel_callback(callback_query: types.CallbackQuery):
                         accept_text = ""
                         if new_payout_uuid and new_payout_uuid != "N/A":
                             print(f"Accepting new payout: {new_payout_uuid}")
-                            async with session.post(
-                                f"{BACKEND_URL}/accept-payouts",
-                                json={"ids": [new_payout_uuid]},
-                                timeout=aiohttp.ClientTimeout(total=30)
-                            ) as accept_resp:
-                                print(f"Accept response status: {accept_resp.status}")
-                                accept_result = await accept_resp.json()
-                                print(f"Accept result: {accept_result}")
-                                
-                                if accept_resp.status == 200:
-                                    accept_success = len(accept_result.get("success", []))
-                                    accept_errors = accept_result.get("error", {})
-                                    if accept_success > 0:
-                                        accept_text = f"\n✅ Принято: {accept_success} новых выплат"
-                                    if accept_errors:
-                                        accept_text += f"\n❌ Ошибки принятия: {str(accept_errors)}"
+                            
+                            # Use retry logic
+                            result = await accept_payout_with_retry(new_payout_uuid, max_retries=3)
+                            
+                            if result.get("success"):
+                                data = result.get("data", {})
+                                accept_success = len(data.get("success", []))
+                                attempt = result.get("attempt", 1)
+                                accept_text = f"\n✅ Принято: {accept_success} новых выплат"
+                                if attempt > 1:
+                                    accept_text += f" (попытка {attempt})"
+                            else:
+                                attempt = result.get("attempt", 1)
+                                accept_text = f"\n❌ Не удалось принять новую выплату"
+                                if attempt > 1:
+                                    accept_text += f" после {attempt} попыток"
                         
                         response_text = f"✅ Отменено: {cancel_success} выплат{accept_text}"
                         if cancel_errors:
